@@ -1,0 +1,58 @@
+from env import MultipleHPCooling
+import json
+from bc_controller import BCController
+import os
+
+
+def test_bc_controller():
+    # Load config
+    with open('sim_config/config0.json', 'r') as f:
+        config = json.load(f)
+
+    config['control_type'] = 'drl'
+
+    # Create test directory
+    test_dir = "data/result/BC/test"
+    if not os.path.exists(test_dir):
+        os.makedirs(test_dir)
+
+    # Initialize environment and controller
+    print("Initializing environment and controller...")
+    env = MultipleHPCooling(config, test_mode=True)
+    controller = BCController(env)
+
+    # Train for one episode
+    print("\nStarting training for one episode...")
+    controller.learn()
+
+    # Test deployment
+    print("\nStarting test deployment...")
+    observation = env.reset()
+    done = False
+    episode_rewards = []
+    total_steps = 0
+
+    while not done:
+        action, _ = controller.predict(observation)
+        observation, reward, done, info = env.step(action)
+        episode_rewards.append(reward)
+        total_steps += 1
+
+        if total_steps % 24 == 0:  # Print daily progress
+            day = total_steps // 24
+            daily_reward = sum(episode_rewards[-24:])
+            print(f"Day {day}: Reward = {daily_reward:.2f}")
+
+    print("\nFinal Results:")
+    print(f"Total Cost: {env.episode_cost:.2f}")
+    print(f"Total Reward: {env.episode_reward:.2f}")
+    print(f"Self Sufficiency: {env.self_sufficiency:.2f}%")
+    print(f"Self Consumption: {env.self_consumption:.2f}%")
+
+    # Save final controller
+    controller.save(f"{test_dir}/final_bc_controller")
+    print(f"\nController saved to {test_dir}/final_bc_controller")
+
+
+if __name__ == "__main__":
+    test_bc_controller()
