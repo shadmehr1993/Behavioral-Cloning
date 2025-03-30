@@ -1,0 +1,145 @@
+import torch
+from stable_baselines3 import SAC
+import numpy as np
+from typing import Tuple, Dict, Any
+
+
+class BCController:
+    def __init__(self, env, trained_model_path="data/result/BC/bc_model.pth", learning_rate=0.0006):
+        """Initialize BC Controller with trained network"""
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        # Load the trained model and its configuration
+        try:
+            self.saved_data = torch.load(trained_model_path, map_location=self.device)
+            self.action_ranges = self.saved_data['action_ranges']
+            print(f"Loaded action ranges with size: {len(self.action_ranges)}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+
+        # Store environment and number of buildings
+        self.env = env
+        self.num_buildings = len(env.config['building_list'])
+        print(f"Number of buildings: {self.num_buildings}")
+
+        # Initialize SAC with custom learning rate
+        try:
+            self.model = SAC(
+                "MlpPolicy",
+                env,
+                learning_rate=learning_rate,
+                buffer_size=24 * 120 * 10,
+                train_freq=24,
+                gradient_steps=20,
+                learning_starts=0,
+                batch_size=64,
+                verbose=1
+            )
+            print(f"Action space shape: {env.action_space.shape}")
+        except Exception as e:
+            print(f"Error initializing SAC: {e}")
+            raise
+
+        # Replace the actor network with our trained BC network
+        self._load_bc_weights_to_actor()
+
+        print("BC Controller initialized successfully")
+
+    def _load_bc_weights_to_actor(self):
+        """Load the trained BC weights into the SAC actor network"""
+        try:
+            bc_state_dict = self.saved_data['model_state_dict']
+            actor_state_dict = self.model.actor.state_dict()
+
+            mapping = {
+                'network.0': 'mu.0',
+                'network.4': 'mu.2',
+                'network.8': 'mu.4',
+                'network.12': 'mu.6',
+                'network.16': 'mu.8'
+            }
+
+            for bc_key, actor_key in mapping.items():
+                if 'weight' in bc_key:
+                    actor_state_dict[f'{actor_key}.weight'] = bc_state_dict[f'{bc_key}.weight']
+                if 'bias' in bc_key:
+                    actor_state_dict[f'{actor_key}.bias'] = bc_state_dict[f'{bc_key}.bias']
+
+            self.model.actor.load_state_dict(actor_state_dict)
+            print("Successfully loaded BC weights into actor network")
+
+        except Exception as e:
+            print(f"Error loading BC weights: {e}")
+            raise
+
+    def format_action(self, action: np.ndarray) -> np.ndarray:
+        """Convert action to normalized array"""
+        try:
+            # Ensure action is in correct shape
+            if len(action) != len(self.env.config['building_list']):
+                action = np.repeat(action, 2)
+
+            # Keep values normalized (between 0 and 1)
+            # The environment will handle the scaling
+            return action
+
+        except Exception as e:
+            print(f"Error in format_action: {e}")
+            print(f"Action shape: {action.shape}")
+            print(f"Action: {action}")
+            raise
+
+        except Exception as e:
+            print(f"Error in format_action: {e}")
+            print(f"Action shape: {action.shape}")
+            print(f"Action: {action}")
+            raise
+
+    def learn(self, total_timesteps: int = 24 * 120) -> None:
+        """Train for one episode with fine-tuning"""
+        print("Starting learning process...")
+        try:
+            self.model.learn(
+                total_timesteps=total_timesteps,
+                log_interval=24,
+                progress_bar=False
+            )
+            print("Learning completed")
+        except Exception as e:
+            print(f"Error during learning: {e}")
+            raise
+
+    def predict(self, observation: np.ndarray, deterministic: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Predict action for given observation"""
+        try:
+            # Get raw action from model
+            action, state = self.model.predict(observation, deterministic=deterministic)
+
+            # Format action for environment
+            formatted_action = self.format_action(action)
+
+            return formatted_action, state
+
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            raise
+
+    def save(self, path: str) -> None:
+        """Save the controller"""
+        try:
+            self.model.save(path)
+            print(f"Controller saved to {path}")
+        except Exception as e:
+            print(f"Error saving controller: {e}")
+            raise
+
+    def load(self, path: str) -> None:
+        """Load a saved controller"""
+        try:
+            self.model = SAC.load(path)
+            print(f"Controller loaded from {path}")
+        except Exception as e:
+            print(f"Error loading controller: {e}")
+            raise
