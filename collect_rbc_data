@@ -1,0 +1,114 @@
+from env import MultipleHPCooling
+import json
+import pandas as pd
+import numpy as np
+from controllers.rbc import RBCController
+import os
+
+# Create directory if it doesn't exist
+save_dir = "data/result/BC"
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+
+# Load config
+with open('sim_config/config0.json', 'r') as f:
+    config = json.load(f)
+
+config['control_type'] = 'rbc'
+env = MultipleHPCooling(config)
+
+# Initialize RBC controllers
+controller_list = []
+action_ranges = []  # Store action ranges for scaling
+for i in config['building_list']:
+    t_tank_range = [7 + 273.15, 17 + 273.15]
+    swt_range = [4 + 273.15, 15 + 273.15]
+    t_out_range = [20, 30]
+    design_mass_flow_rate = config['init_params'][i]['m_1_input']
+    starting_control = 0.0
+    controller = RBCController(t_tank_range, swt_range, t_out_range, design_mass_flow_rate, starting_control)
+    controller_list.append(controller)
+
+    # Store ranges for each building's actions
+    action_ranges.extend([
+        (0, design_mass_flow_rate),  # mass flow range
+        (swt_range[0], swt_range[1])  # temperature range
+    ])
+
+# Convert action ranges to numpy arrays for scaling
+action_mins = np.array([r[0] for r in action_ranges])
+action_maxs = np.array([r[1] for r in action_ranges])
+
+# Data collection
+states = []
+actions = []
+raw_actions = []  # Store unscaled actions for verification
+
+print("Starting data collection...")
+observation = env.reset()
+done = False
+episode_steps = 0
+
+while not done:
+    # Get RBC actions
+    action_list = []
+    for i in range(len(controller_list)):
+        action = controller_list[i].evaluate_action(
+            env.tank_temperature_list[i],
+            env.weather_data.loc[env.simulation_index - 3600]['t_out']
+        )
+        action_list.append(action)
+
+    # Flatten and store raw actions
+    flat_actions = np.array([item for sublist in action_list for item in sublist])
+    raw_actions.append(flat_actions)
+
+    # Scale actions to [0,1] range
+    scaled_actions = (flat_actions - action_mins) / (action_maxs - action_mins)
+
+    # Store state-action pair
+    states.append(observation)
+    actions.append(scaled_actions)
+
+    # Take step
+    next_observation, reward, done, info = env.step(action_list)
+    observation = next_observation
+    episode_steps += 1
+
+    if episode_steps % 24 == 0:  # Print progress every day
+        print(f"Collected {episode_steps} steps (Day {episode_steps // 24})")
+
+# Convert to numpy arrays
+states = np.array(states)
+actions = np.array(actions)
+raw_actions = np.array(raw_actions)
+
+# Save data with scaling information
+save_path = f"{save_dir}/rbc_data.npz"
+np.savez(save_path,
+         states=states,
+         actions=actions,
+         raw_actions=raw_actions,
+         state_min=env.min_values,
+         state_max=env.max_values,
+         action_mins=action_mins,
+         action_maxs=action_maxs)
+
+print("\nData Collection Complete!")
+print(f"Saved to: {save_path}")
+print(f"Total timesteps: {len(states)}")
+print(f"States shape: {states.shape}")
+print(f"Actions shape: {actions.shape}")
+
+# Print action ranges for verification
+print("\nAction Ranges:")
+for i in range(len(action_mins)):
+    if i % 2 == 0:
+        print(f"Building {i // 2} mass flow: [{action_mins[i]:.2f}, {action_maxs[i]:.2f}]")
+    else:
+        print(f"Building {i // 2} temperature: [{action_mins[i]:.2f}, {action_maxs[i]:.2f}]")
+
+# Verify scaling worked correctly
+print("\nScaling Verification:")
+print(f"Max scaled action: {actions.max():.4f}")
+print(f"Min scaled action: {actions.min():.4f}")
