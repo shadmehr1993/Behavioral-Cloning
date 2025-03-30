@@ -1,0 +1,341 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pathlib import Path
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import pandas as pd
+
+
+class RBCDataset(Dataset):
+    def __init__(self, states, actions):
+        self.states = torch.FloatTensor(states)
+        self.actions = torch.FloatTensor(actions)
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx]
+
+
+class BCNetwork(nn.Module):
+    def __init__(self, input_dim=88, hidden_dim=256, output_dim=8):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(hidden_dim, output_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class BCTrainer:
+    def __init__(self, state_dim=88, hidden_dim=256):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        # Paths setup
+        self.data_dir = Path("data/result/BC")
+        self.save_dir = Path("data/result/BC_trained")
+
+        print(f"Data directory: {self.data_dir}")
+        print(f"Save directory: {self.save_dir}")
+
+        # Create save directory if it doesn't exist
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize network and training components
+        self.policy_net = BCNetwork(state_dim, hidden_dim).to(self.device)
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=0.001)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=20, verbose=True
+        )
+        self.criterion = nn.MSELoss()
+
+        # Initialize metrics tracking
+        self.metrics = {
+            'epoch': [],
+            'policy_loss': [],
+            'reward_loss': [],
+            'rmse_overall': [],
+            'rmse_mass_flow': [],
+            'rmse_temperature': [],
+            'mape_mass_flow': [],
+            'mape_temperature': [],
+            'train_loss': [],
+            'test_loss': [],
+            'action_stats': []
+        }
+
+    def load_data(self):
+        data_path = self.data_dir / "rbc_data.npz"
+        print(f"Loading data from: {data_path}")
+
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data file not found at: {data_path}")
+
+        data = np.load(data_path)
+        states = data['states']
+        actions = data['actions']
+        action_mins = data['action_mins']
+        action_maxs = data['action_maxs']
+
+        return states, actions, list(zip(action_mins, action_maxs))
+
+    def calculate_metrics(self, predictions, targets, action_ranges):
+        """Calculate comprehensive metrics for evaluation"""
+        # Unscale predictions and targets
+        action_mins = np.array([r[0] for r in action_ranges])
+        action_maxs = np.array([r[1] for r in action_ranges])
+
+        if torch.is_tensor(predictions):
+            predictions = predictions.cpu().detach().numpy()
+        if torch.is_tensor(targets):
+            targets = targets.cpu().detach().numpy()
+
+        preds_unscaled = predictions * (action_maxs - action_mins) + action_mins
+        targets_unscaled = targets * (action_maxs - action_mins) + action_mins
+
+        # Split into mass flow and temperature
+        mass_flow_pred = preds_unscaled[:, ::2]
+        mass_flow_target = targets_unscaled[:, ::2]
+        temp_pred = preds_unscaled[:, 1::2]
+        temp_target = targets_unscaled[:, 1::2]
+
+        # Calculate RMSE
+        rmse_overall = np.sqrt(np.mean((preds_unscaled - targets_unscaled) ** 2))
+        rmse_mass_flow = np.sqrt(np.mean((mass_flow_pred - mass_flow_target) ** 2))
+        rmse_temp = np.sqrt(np.mean((temp_pred - temp_target) ** 2))
+
+        # Calculate MAPE
+        def safe_mape(y_true, y_pred):
+            mask = np.abs(y_true) > 1e-7
+            if mask.any():
+                return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+            return 0.0
+
+        mape_mass_flow = safe_mape(mass_flow_target, mass_flow_pred)
+        mape_temp = safe_mape(temp_target - 273.15, temp_pred - 273.15)  # Convert to Celsius for MAPE
+
+        return {
+            'rmse_overall': rmse_overall,
+            'rmse_mass_flow': rmse_mass_flow,
+            'rmse_temperature': rmse_temp,
+            'mape_mass_flow': mape_mass_flow,
+            'mape_temperature': mape_temp
+        }
+
+    def plot_training_metrics(self):
+        """Plot comprehensive training metrics"""
+        fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(20, 15))
+
+        # Policy Loss
+        ax1.plot(self.metrics['epoch'], self.metrics['policy_loss'], label='Policy Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Policy Loss')
+        ax1.grid(True)
+        ax1.legend()
+
+        # Reward Loss
+        ax2.plot(self.metrics['epoch'], self.metrics['reward_loss'], label='Reward Loss')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss')
+        ax2.set_title('Reward Loss')
+        ax2.grid(True)
+        ax2.legend()
+
+        # RMSE
+        ax3.plot(self.metrics['epoch'], self.metrics['rmse_overall'], label='Overall')
+        ax3.plot(self.metrics['epoch'], self.metrics['rmse_mass_flow'], label='Mass Flow')
+        ax3.plot(self.metrics['epoch'], self.metrics['rmse_temperature'], label='Temperature')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('RMSE')
+        ax3.set_title('RMSE')
+        ax3.grid(True)
+        ax3.legend()
+
+        # MAPE
+        ax4.plot(self.metrics['epoch'], self.metrics['mape_mass_flow'], label='Mass Flow')
+        ax4.plot(self.metrics['epoch'], self.metrics['mape_temperature'], label='Temperature')
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('MAPE (%)')
+        ax4.set_title('MAPE (%)')
+        ax4.grid(True)
+        ax4.legend()
+
+        # Training vs Testing Loss
+        ax5.plot(self.metrics['epoch'], self.metrics['train_loss'], label='Train Loss')
+        ax5.plot(self.metrics['epoch'], self.metrics['test_loss'], label='Test Loss')
+        ax5.set_xlabel('Epoch')
+        ax5.set_ylabel('Loss')
+        ax5.set_title('Training and Testing Loss')
+        ax5.grid(True)
+        ax5.legend()
+
+        plt.tight_layout()
+        plot_path = self.save_dir / f"training_metrics_epoch_{self.metrics['epoch'][-1]}.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def save_best_model(self, epoch, metrics):
+        """Save the best model and its metrics"""
+        save_path = self.save_dir / "best_model.pth"
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.policy_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'metrics': self.metrics,
+            'best_metrics': metrics
+        }, save_path)
+        print(f"Saved best model to {save_path}")
+
+    def train(self, n_epochs=1000, batch_size=64):
+        print("\nStarting BC training...")
+        try:
+            # Load and prepare data
+            states, actions, action_ranges = self.load_data()
+
+            # Split data
+            states_train, states_test, actions_train, actions_test = train_test_split(
+                states, actions, test_size=0.2, random_state=42
+            )
+
+            # Create dataloaders
+            train_dataset = RBCDataset(states_train, actions_train)
+            test_dataset = RBCDataset(states_test, actions_test)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            test_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+            best_val_loss = float('inf')
+            patience = 50
+            patience_counter = 0
+
+            print(f"Training samples: {len(states_train)}, Test samples: {len(states_test)}")
+
+            for epoch in range(n_epochs):
+                # Training phase
+                self.policy_net.train()
+                train_loss = 0
+                train_predictions = []
+                train_targets = []
+
+                for states, actions in train_loader:
+                    states, actions = states.to(self.device), actions.to(self.device)
+                    predictions = self.policy_net(states)
+                    loss = self.criterion(predictions, actions)
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+
+                    train_loss += loss.item()
+                    train_predictions.extend(predictions.detach().cpu().numpy())
+                    train_targets.extend(actions.detach().cpu().numpy())
+
+                avg_train_loss = train_loss / len(train_loader)
+
+                # Testing phase
+                self.policy_net.eval()
+                test_loss = 0
+                test_predictions = []
+                test_targets = []
+
+                with torch.no_grad():
+                    for states, actions in test_loader:
+                        states, actions = states.to(self.device), actions.to(self.device)
+                        predictions = self.policy_net(states)
+                        loss = self.criterion(predictions, actions)
+                        test_loss += loss.item()
+                        test_predictions.extend(predictions.cpu().numpy())
+                        test_targets.extend(actions.cpu().numpy())
+
+                avg_test_loss = test_loss / len(test_loader)
+
+                # Calculate metrics
+                metrics = self.calculate_metrics(
+                    np.array(test_predictions),
+                    np.array(test_targets),
+                    action_ranges
+                )
+
+                # Update metrics history
+                self.metrics['epoch'].append(epoch)
+                self.metrics['policy_loss'].append(avg_train_loss)
+                self.metrics['reward_loss'].append(avg_test_loss)
+                self.metrics['train_loss'].append(avg_train_loss)
+                self.metrics['test_loss'].append(avg_test_loss)
+                self.metrics['rmse_overall'].append(metrics['rmse_overall'])
+                self.metrics['rmse_mass_flow'].append(metrics['rmse_mass_flow'])
+                self.metrics['rmse_temperature'].append(metrics['rmse_temperature'])
+                self.metrics['mape_mass_flow'].append(metrics['mape_mass_flow'])
+                self.metrics['mape_temperature'].append(metrics['mape_temperature'])
+
+                # Learning rate scheduling
+                self.scheduler.step(avg_test_loss)
+
+                # Plot metrics every 10 epochs
+                if (epoch + 1) % 10 == 0:
+                    self.plot_training_metrics()
+                    print(f"\nEpoch {epoch + 1}/{n_epochs}")
+                    print(f"Train Loss: {avg_train_loss:.6f}")
+                    print(f"Test Loss: {avg_test_loss:.6f}")
+                    print(f"Overall RMSE: {metrics['rmse_overall']:.4f}")
+                    print(f"Mass Flow - RMSE: {metrics['rmse_mass_flow']:.4f}, MAPE: {metrics['mape_mass_flow']:.2f}%")
+                    print(
+                        f"Temperature - RMSE: {metrics['rmse_temperature']:.4f}, MAPE: {metrics['mape_temperature']:.2f}%")
+
+                # Early stopping and model saving
+                if avg_test_loss < best_val_loss:
+                    best_val_loss = avg_test_loss
+                    self.save_best_model(epoch, metrics)
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    print(f"\nEarly stopping triggered at epoch {epoch + 1}")
+                    break
+
+            print("\nTraining completed!")
+            print(f"Best validation loss: {best_val_loss:.6f}")
+
+            # Save final metrics plot
+            self.plot_training_metrics()
+
+        except Exception as e:
+            print(f"\nError occurred during training: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    print("Starting BC training process...")
+    try:
+        trainer = BCTrainer()
+        trainer.train()
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
