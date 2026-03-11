@@ -1,58 +1,740 @@
+# test_bc_controller.py
 from env import MultipleHPCooling
-import json
 from bc_controller import BCController
-import os
+import json, os, re
+from datetime import datetime
+import numpy as np
+import pandas as pd
+
+# Headless plotting
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator, ScalarFormatter
 
 
-def test_bc_controller():
-    # Load config
-    with open('sim_config/config0.json', 'r') as f:
+def visualize_bc_results(env, config):
+    """
+    Generates plots + a clean summary CSV (exact headers). Also writes:
+      - columns_report.txt
+      - head_preview.csv
+      - summary_column_mapping.json (what columns were used)
+      - summary_input_stats.csv (min/median/max of used cols)
+    """
+    # ---------- paths ----------
+    # Save all figures/data to the run folder (result_path/Test_{test_number})
+    out_dir = getattr(env, "res_path", config.get("result_path", "data/result/BC"))
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = f"{env.res_path}/test.csv" if getattr(env, "test_mode", False) else f"{env.res_path}/episode_1.csv"
+    if not os.path.exists(csv_path):
+        print(f"❌ Results file not found: {csv_path}")
+        return False
+
+    # ---------- data ----------
+    try:
+        df = pd.read_csv(csv_path, sep=';', decimal=',')
+    except Exception:
+        df = pd.read_csv(csv_path)
+    print(f"✅ Loaded {len(df)} rows from {csv_path}")
+
+    # ---------- time base ----------
+    if "simulation_index" in df.columns:
+        df["_hours_from_start"] = (df["simulation_index"] - df["simulation_index"].min()) / 3600.0
+    elif "time" in df.columns:
+        df["_hours_from_start"] = (df["time"] - df["time"].min()) / 3600.0
+    else:
+        df["_hours_from_start"] = np.arange(len(df), dtype=float)
+    df["_days"] = df["_hours_from_start"] / 24.0
+    df["_hour_of_day"] = (df["_hours_from_start"] % 24).astype(int)
+    df["_day_index"] = df["_days"].astype(int)
+
+    diffs = np.diff(df["_hours_from_start"].to_numpy())
+    hrs_per_step = float(np.nanmedian(diffs)) if len(diffs) else 1.0
+    if not np.isfinite(hrs_per_step) or hrs_per_step <= 0:
+        hrs_per_step = 1.0
+    w48 = max(1, int(round(48 / hrs_per_step)))
+
+    # ---------- helpers ----------
+    def to_celsius(arr):
+        a = pd.to_numeric(pd.Series(arr), errors="coerce").to_numpy()
+        return a - 273.15 if np.nanmedian(a) > 150 else a
+
+    def to_num(series):
+        return pd.to_numeric(series, errors="coerce").to_numpy()
+
+    cols_lower = {c.lower(): c for c in df.columns}
+    all_cols_lower = list(cols_lower.keys())
+
+    def score_column(col_lower: str, must_have=None, any_of=None, none_of=None):
+        s = 0; txt = col_lower
+        if must_have:
+            for k in must_have: s += 2 if k in txt else -4
+        if any_of:
+            for k in any_of:
+                if k in txt: s += 1
+        if none_of:
+            for k in none_of:
+                if k in txt: s -= 3
+        return s
+
+    def find_best(must_have=None, any_of=None, none_of=None, prefer_building=None, avoid_building=None):
+        best, best_score = None, -1e9
+        for cl in all_cols_lower:
+            pref_bonus = 0
+            if prefer_building and prefer_building.lower() in cl: pref_bonus += 3
+            if avoid_building and avoid_building.lower() in cl:   pref_bonus -= 2
+            sc = score_column(cl, must_have, any_of, none_of) + pref_bonus
+            if sc > best_score:
+                best, best_score = cl, sc
+        if best_score <= -5: return None
+        return cols_lower[best]
+
+    def mma(y, w):
+        s = pd.Series(np.asarray(y, dtype=float))
+        return s.rolling(window=w, min_periods=1).mean().values
+
+    def savefig(path):
+        plt.tight_layout()
+        plt.savefig(path, dpi=300)
+        plt.close()
+        print(f"📈 Saved {path}")
+
+    def fix_axis_scale(ax):
+        """Prevent spurious 1e16 scientific notation on y-axis."""
+        for axis in [ax.yaxis, ax.xaxis]:
+            f = ScalarFormatter(useOffset=False)
+            f.set_scientific(False)
+            axis.set_major_formatter(f)
+
+    B_list = list(config.get("building_list", [])) or ["Building1"]
+
+    def building_display_name(b, idx):
+        """Use test_number (e.g. Target_building_1) for display when single building; else format Building1 -> Building 1."""
+        tn = str(config.get("test_number", ""))
+        m = re.search(r"[bB]uilding[_\-]?(\d+)", tn, re.I)
+        if m and len(B_list) == 1:
+            return f"Building {int(m.group(1))}"
+        n = re.search(r"(\d+)$", b)
+        return f"Building {n.group(1)}" if n else b
+
+    # ============================== PLOTS ==============================
+
+    # --------- tolerant column helpers (no-skip) ----------
+    ALIAS_GLOBAL = {
+        "grid":   ["grid_to_hp", "grid_to_building", "total_grid", "grid", "site_grid", "grid_kwh"],
+        "pv2b":   ["pv_to_hp", "pv_direct", "pv_to_load", "pv_to_building", "pv_load"],
+        "bess2b": ["bess_to_hp", "battery_to_building", "battery_to_load", "bat_to_load", "batt_to_hp"],
+        "pv2bat": ["pv_to_bess_dc", "pv_to_battery", "pv_to_batt"],
+        "pv2grid":["pv_to_grid", "feed_in", "export"],
+        "cost":   ["cost", "electricity_cost", "price_cost", "total_cost"],
+        "soc":    ["bess_soc", "soc", "battery_soc"],
+        "total_e":["total_ee_hp", "total_electric", "total_kwh", "demand_kwh", "site_kwh"],
+    }
+
+    def building_aliases(b):
+        bl = b.lower()
+        return {
+            "swt2": [f"{b}_secondary_loop_swt", f"{bl}_swt_2", f"{bl}_supply_2", "sensor_swt_2.t", "swt_2", "swt2"],
+            "rwt2": [f"{b}_secondary_loop_rwt", f"{bl}_rwt_2", f"{bl}_return_2", "sensor_rwt_2.t", "rwt_2", "rwt2"],
+            "m2":   [f"{b}_secondary_loop_flow_rate", f"{bl}_m_2", "pump_2.m_flow", "m2", "m_2", "sec_flow"],
+            "ps":   [f"{b}_primary_loop_swt", f"{bl}_swt_1", "sensor_swt_1.t", "swt_1", "primary_supply"],
+            "pr":   [f"{b}_primary_loop_rwt", f"{bl}_rwt_1", "sensor_rwt_1.t", "rwt_1", "primary_return"],
+            "tes":  [f"{b}_tank_t", f"{bl}_tank_t", "sensor_tank.t", "tes", "tank"],
+            "m1":   [f"{b}_primary_loop_flow_rate", f"{bl}_m_1", "pump_1.m_flow", "m1", "m_1", "pri_flow"],
+            "elec": [f"{b}_electrical_energy", f"{bl}_kwh", f"{bl}_electric", "building_kwh"],
+        }
+
+    def pick_col(preferred_names, any_tokens=None, none_tokens=None):
+        # 1) exact match
+        for name in (preferred_names or []):
+            if name in df.columns:
+                return name
+        # 2) your existing fuzzy finder
+        if any_tokens or none_tokens:
+            cand = find_best(any_of=[t.lower() for t in (any_tokens or [])],
+                             none_of=[t.lower() for t in (none_tokens or [])])
+            if cand: return cand
+        # 3) substring alias search
+        wants = (preferred_names or []) + (any_tokens or [])
+        wants_l = [w.lower() for w in wants if w]
+        for col in df.columns:
+            cl = col.lower()
+            if any(w in cl for w in wants_l):
+                return col
+        return None
+
+    def get_grid_series():
+        gcol = pick_col(ALIAS_GLOBAL["grid"], any_tokens=["grid","kwh","energy"], none_tokens=["cost","price","soc"])
+        if gcol:
+            return to_num(df[gcol])
+        # fallback derive: total - pv - battery (clip >=0)
+        tcol = pick_col(ALIAS_GLOBAL["total_e"], any_tokens=["total","kwh","energy"])
+        pcol = pick_col(ALIAS_GLOBAL["pv2b"],   any_tokens=["pv","solar","to","load","building"])
+        bcol = pick_col(ALIAS_GLOBAL["bess2b"], any_tokens=["battery","bess","to","load","building"])
+        if tcol:
+            tot = to_num(df[tcol])
+            pv  = to_num(df[pcol]) if pcol else 0.0
+            ba  = to_num(df[bcol]) if bcol else 0.0
+            return np.clip(tot - pv - ba, 0, None)
+        return None
+
+    tes_min_K, tes_max_K = 7 + 273.15, 17 + 273.15
+
+    # ---------- 1) District TES + Primary (2x2, one per building) ----------
+    n_b = len(B_list)
+    ncols = min(2, n_b)
+    nrows = (n_b + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4 * nrows), sharex=True)
+    if n_b == 1:
+        axes = np.array([[axes]])
+    axes = axes.flatten()[:n_b]
+    for idx, b in enumerate(B_list):
+        ax = axes[idx]
+        al = building_aliases(b)
+        tes = pick_col(al["tes"], any_tokens=["tes","tank"])
+        m1  = pick_col(al["m1"],  any_tokens=["flow","primary","m_1","kg/s"])
+        if tes:
+            ax.plot(df["_days"], to_celsius(df[tes]), "b-", linewidth=1.5, label="TES (°C)")
+            vals_K = to_num(df[tes])
+            below = int(np.nansum(vals_K < tes_min_K)); above = int(np.nansum(vals_K > tes_max_K))
+            ax.text(0.02, 0.95, f"Violations: {below} below, {above} above", transform=ax.transAxes, fontsize=9)
+        ax.axhline(7.0,  ls="--", color="gray", alpha=0.7)
+        ax.axhline(17.0, ls="--", color="gray", alpha=0.7)
+        ax.set_title(building_display_name(b, idx)); ax.set_ylabel("TES (°C)"); ax.grid(alpha=0.25); ax.legend(loc="upper right", fontsize=8)
+    for idx in range(n_b, len(axes)):
+        fig.delaxes(axes[idx])
+    for ax in axes[:n_b]:
+        fix_axis_scale(ax)
+    fig.suptitle("District: TES Temperature (BC)", fontsize=12, y=0.98)
+    plt.setp(axes[-1], xlabel="Days")
+    savefig(os.path.join(out_dir, "district_tes_bc.png"))
+
+    # ---------- 2) District Heat Pump Cycles (2x2) ----------
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 3 * nrows), sharex=True)
+    axes = axes.flatten()[:n_b]
+    for idx, b in enumerate(B_list):
+        ax = axes[idx]
+        al = building_aliases(b)
+        m1 = pick_col(al["m1"], any_tokens=["flow","primary","m_1","kg/s"])
+        if m1:
+            hp = to_num(df[m1])
+            ax.step(df["_days"], hp, where="post")
+            cycles = int(((hp[1:] > 0) & (hp[:-1] <= 0)).sum())
+            ax.text(0.02, 0.90, f"HP Cycles: {cycles}", transform=ax.transAxes, fontsize=9)
+        ax.set_title(building_display_name(b, idx)); ax.set_ylabel("Flow (kg/s)"); ax.grid(alpha=0.25)
+    for idx in range(n_b, len(axes)):
+        fig.delaxes(axes[idx])
+    for ax in axes[:n_b]:
+        fix_axis_scale(ax)
+    fig.suptitle("District: Heat Pump Operation (BC)", fontsize=12, y=0.98)
+    plt.setp(axes[-1], xlabel="Days")
+    savefig(os.path.join(out_dir, "district_hp_cycles_bc.png"))
+
+    # ---------- 3) Carpet plot (never skip; show placeholder if needed) ----------
+    grid_series = get_grid_series()
+    plt.figure(figsize=(15, 10))
+    carpet = None
+    if grid_series is not None:
+        tmp = df.copy(); tmp["_grid"] = grid_series
+        try:
+            carpet = tmp.pivot_table(index="_day_index", columns="_hour_of_day",
+                                     values="_grid", aggfunc="sum").fillna(0)
+        except Exception:
+            carpet = None
+
+    if (carpet is not None) and carpet.size:
+        vmax = max(13, np.nanpercentile(carpet.values, 98)) if np.nanmax(carpet.values) > 0 else 13
+        im = plt.imshow(carpet.values, aspect="auto", origin="lower", cmap="YlOrRd", vmin=0, vmax=vmax)
+        cbar = plt.colorbar(im, label="Grid Electricity Consumption (kWh)", shrink=0.8)
+        cbar.ax.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+        yticks = np.linspace(0, carpet.shape[0]-1, min(12, carpet.shape[0])).astype(int)
+        plt.yticks(yticks, [f"Day {int(carpet.index[i])+1}" for i in yticks])
+        xticks = np.arange(0, 24, 3); plt.xticks(xticks, [f"{h:02d}:00" for h in xticks])
+        plt.title("Carpet Plot: Grid Electricity Consumption Over Summer")
+        plt.xlabel("Hour of Day"); plt.ylabel("Day of Simulation")
+    else:
+        plt.title("Carpet Plot: Grid Electricity Consumption Over Summer")
+        plt.xlabel("Hour of Day"); plt.ylabel("Day of Simulation")
+        plt.text(0.5, 0.5, "No grid-like data (derived or measured)", ha="center", va="center")
+    savefig(os.path.join(out_dir, "carpet_plot_bc.png"))
+
+    # ---------- 4) Electrical load profile (never skip) ----------
+    per_b_e = []
+    for b in B_list:
+        al = building_aliases(b)
+        col = pick_col(al["elec"], any_tokens=["electrical","kwh","energy"])
+        if col: per_b_e.append((b, col))
+
+    plt.figure(figsize=(16, 9))
+    if per_b_e:
+        total = np.zeros(len(df)); used_labels=set()
+        for idx, (b, col) in enumerate(per_b_e):
+            y = to_num(df[col]); total += y
+            lbl = building_display_name(b, idx)
+            if lbl in used_labels: lbl = f"{lbl} ({col})"
+            used_labels.add(lbl)
+            plt.plot(df["_days"], y, label=lbl)
+        plt.plot(df["_days"], total, linewidth=2.2, color="black", label="Total Consumption")
+        plt.title("Electrical Load Profile (Gross) with Behavioral Cloning")
+        plt.xlabel("Days"); plt.ylabel("Electrical Energy (kWh)")
+        plt.legend(ncol=min(5, len(per_b_e)+1), frameon=False); plt.grid(alpha=0.25)
+        fix_axis_scale(plt.gca())
+    else:
+        gs = grid_series if grid_series is not None else np.zeros(len(df))
+        plt.plot(df["_days"], gs, label="Grid (derived)" if grid_series is None else "Grid")
+        plt.title("Electrical Load Profile (Grid Only) with Behavioral Cloning")
+        plt.xlabel("Days"); plt.ylabel("Electrical Energy (kWh)")
+        plt.legend(frameon=False); plt.grid(alpha=0.25)
+        fix_axis_scale(plt.gca())
+    savefig(os.path.join(out_dir, "electrical_load_profile_bc.png"))
+
+    # ---------- 5) PV vs Load 7-day sample ----------
+    pv_col = "pv_power_production" if "pv_power_production" in df.columns else find_best(any_of=["pv","power","production"], none_of=["cost","grid"])
+    tcol = "total_ee_hp" if "total_ee_hp" in df.columns else pick_col(ALIAS_GLOBAL["total_e"], any_tokens=["total","ee_hp","kwh"])
+    if pv_col is not None and tcol is not None:
+        ndays = min(7, len(df) // 24)
+        idx_end = ndays * 24
+        if idx_end > 0:
+            fig, ax = plt.subplots(figsize=(12, 5))
+            x = df["_hours_from_start"].iloc[:idx_end]
+            ax.fill_between(x, 0, to_num(df[pv_col].iloc[:idx_end]), alpha=0.6, label="PV (kW)")
+            ax.plot(x, to_num(df[tcol].iloc[:idx_end]), "k-", linewidth=2, label="Total HP (kWh)")
+            grid_s = get_grid_series()
+            if grid_s is not None:
+                ax.plot(x, grid_s[:idx_end], "r--", alpha=0.8, label="Grid import (kWh)")
+            ax.set_xlabel("Hours"); ax.set_ylabel("Energy (kWh)"); ax.set_title(f"PV vs Load (first {ndays} days) - BC"); ax.legend(); ax.grid(alpha=0.3)
+            fix_axis_scale(ax)
+            savefig(os.path.join(out_dir, "pv_vs_load_7day_bc.png"))
+
+    # ---------- 6) Cumulative cost ----------
+    cost_plot = pick_col(ALIAS_GLOBAL["cost"], any_tokens=["cost","price","tariff"])
+    if cost_plot:
+        cum = np.nancumsum(to_num(df[cost_plot]))
+        plt.figure(figsize=(10, 5))
+        ax = plt.gca()
+        plt.plot(df["_days"], cum, "b-", linewidth=2)
+        tot_val = float(cum[-1])
+        plt.axhline(tot_val, color="gray", ls="--", alpha=0.7, label=f"Total: €{tot_val:,.2f}")
+        plt.xlabel("Days"); plt.ylabel("Cumulative Cost (€)"); plt.title("Cumulative Electricity Cost - BC"); plt.legend(); plt.grid(alpha=0.3)
+        fix_axis_scale(ax)
+        savefig(os.path.join(out_dir, "cumulative_cost_bc.png"))
+
+    # ---------- 7) Dashboard picks (tolerant) ----------
+    pv_direct_plot = pick_col(ALIAS_GLOBAL["pv2b"],   any_tokens=["pv","solar","to","load","building"])
+    b2b_plot       = pick_col(ALIAS_GLOBAL["bess2b"], any_tokens=["battery","bess","to","load","building"])
+    g2b_plot       = pick_col(ALIAS_GLOBAL["grid"],   any_tokens=["grid","kwh","energy"], none_tokens=["cost","price","soc"])
+    if g2b_plot is None:
+        tmp_g = get_grid_series()
+        if tmp_g is not None:
+            df["_grid_fallback"] = tmp_g
+            g2b_plot = "_grid_fallback"
+    cost_plot      = pick_col(ALIAS_GLOBAL["cost"],   any_tokens=["cost","price","tariff"])
+    soc_plot       = pick_col(ALIAS_GLOBAL["soc"],    any_tokens=["soc","state of charge"])
+
+    # ---------- 5a) Dashboard figure (reuse your layout) ----------
+    if any([pv_direct_plot, b2b_plot, g2b_plot, cost_plot, soc_plot]):
+        fig = plt.figure(figsize=(16, 12))
+        gs = fig.add_gridspec(3, 2, height_ratios=[1,1,1.1], width_ratios=[1,1], hspace=0.6, wspace=0.35)
+
+        # Daily composition (stack of PV/Battery/Grid)
+        axA = fig.add_subplot(gs[0,0])
+        stack, labels = [], []
+        if pv_direct_plot is not None: stack.append(to_num(df[pv_direct_plot])); labels.append("PV Direct")
+        if b2b_plot is not None:      stack.append(to_num(df[b2b_plot]));       labels.append("Battery")
+        if g2b_plot is not None:      stack.append(to_num(df[g2b_plot]));       labels.append("Grid")
+        if stack:
+            axA.stackplot(df["_days"], stack, labels=labels, alpha=0.85)
+            axA.set_title("Daily Energy Sources Composition")
+            axA.set_ylabel("Energy (kWh)"); axA.set_xlabel("Days")
+            axA.legend(loc="upper left", frameon=False); axA.grid(alpha=0.2)
+            fix_axis_scale(axA)
+        else:
+            axA.text(0.5,0.5,"No energy split columns",ha="center",va="center"); axA.set_axis_off()
+
+        # 48-hour moving averages of flows
+        axB = fig.add_subplot(gs[0,1])
+        any_flow=False
+        if pv_direct_plot is not None: axB.plot(df["_days"], mma(df[pv_direct_plot], w48), label="PV to Building"); any_flow=True
+        if b2b_plot is not None:       axB.plot(df["_days"], mma(df[b2b_plot],      w48), label="Battery to Building"); any_flow=True
+        if g2b_plot is not None:       axB.plot(df["_days"], mma(df[g2b_plot],      w48), label="Grid to Building"); any_flow=True
+        if any_flow:
+            axB.set_title("Energy Flow Patterns (48-hour MA)")
+            axB.set_ylabel("Energy (kWh)"); axB.set_xlabel("Days")
+            axB.legend(frameon=False); axB.grid(alpha=0.2)
+            fix_axis_scale(axB)
+        else:
+            axB.text(0.5,0.5,"No flow data",ha="center",va="center"); axB.set_axis_off()
+
+        # Cost (hourly bars + 48h MA)
+        axC = fig.add_subplot(gs[1,0])
+        if cost_plot:
+            arr = to_num(df[cost_plot])
+            axC.bar(df["_days"], arr, alpha=0.25)
+            axC.plot(df["_days"], mma(arr, w48), linewidth=2)
+            axC.set_title("Daily Electricity Cost (hourly bars + 48h MA)")
+            axC.set_ylabel("Cost (€)"); axC.set_xlabel("Days"); axC.grid(alpha=0.2)
+            fix_axis_scale(axC)
+        else:
+            axC.text(0.5,0.5,"No cost column",ha="center",va="center"); axC.set_axis_off()
+
+        # SOC
+        axD = fig.add_subplot(gs[1,1])
+        if soc_plot:
+            soc = to_num(df[soc_plot])
+            axD.plot(df["_days"], soc, linewidth=2)
+            rising = np.r_[False, (soc[1:] - soc[:-1]) > 0]
+            if rising.any():
+                starts = np.where((~rising[:-1]) & rising[1:])[0] + 1
+                ends   = np.where((rising[:-1]) & (~rising[1:]))[0] + 1
+                if rising[0]:  starts = np.r_[0, starts]
+                if rising[-1]: ends   = np.r_[ends, len(rising)-1]
+                for s, e in zip(starts, ends):
+                    axD.axvspan(df["_days"].iloc[s], df["_days"].iloc[e], alpha=0.08)
+            axD.set_title("Battery State of Charge"); axD.set_ylabel("SOC"); axD.set_xlabel("Days"); axD.grid(alpha=0.2)
+            fix_axis_scale(axD)
+        else:
+            axD.text(0.5,0.5,"No SOC column",ha="center",va="center"); axD.set_axis_off()
+
+        # Pie totals
+        axE = fig.add_subplot(gs[2,0])
+        pieces, labels2 = [], []
+        if pv_direct_plot is not None: pieces.append(np.nansum(to_num(df[pv_direct_plot]))); labels2.append("PV Direct")
+        if b2b_plot is not None:      pieces.append(np.nansum(to_num(df[b2b_plot])));       labels2.append("Battery")
+        if g2b_plot is not None:      pieces.append(np.nansum(to_num(df[g2b_plot])));       labels2.append("Grid")
+        if sum(pieces) > 0:
+            axE.pie(pieces, labels=labels2, autopct="%1.1f%%", startangle=120); axE.set_title("Energy Source Distribution")
+        else:
+            axE.text(0.5,0.5,"No energy totals",ha="center",va="center"); axE.set_axis_off()
+
+        # KPIs: Cost (text) + Self-Sufficiency, Self-Consumption (bars)
+        axF = fig.add_subplot(gs[2,1])
+        ss = getattr(env,"self_sufficiency",None); sc = getattr(env,"self_consumption",None); cost_val = getattr(env,"episode_cost",None)
+        if (ss is not None) or (sc is not None) or (cost_val is not None):
+            vals, labs = [], []
+            if ss is not None: vals.append(float(ss)); labs.append("Self-Suff. (%)")
+            if sc is not None: vals.append(float(sc)); labs.append("Self-Cons. (%)")
+            if vals:
+                axF.bar(np.arange(len(vals)), vals, color=["#3498db","#9b59b6"][:len(vals)])
+                for i, v in enumerate(vals): axF.text(i, v+2, f"{v:.1f}%", ha="center", va="bottom", fontsize=10)
+                axF.set_xticks(np.arange(len(vals))); axF.set_xticklabels(labs); axF.set_ylim(0, 105); axF.set_ylabel("%")
+            if cost_val is not None:
+                axF.text(0.5, 0.95, f"Total Cost: €{cost_val:.2f}", transform=axF.transAxes, ha="center", va="top", fontsize=11, fontweight="bold")
+            axF.set_title("Performance KPIs"); axF.grid(axis="y", alpha=0.2)
+        else:
+            axF.text(0.5,0.5,"No KPI values",ha="center",va="center"); axF.set_axis_off()
+
+        savefig(os.path.join(out_dir, "energy_dashboard_bc.png"))
+    else:
+        # Still save a placeholder dashboard
+        plt.figure(figsize=(8, 3))
+        plt.axis("off"); plt.title("Energy Dashboard")
+        plt.text(0.5,0.5,"No energy/cost/SOC columns found",ha="center",va="center")
+        savefig(os.path.join(out_dir, "energy_dashboard_bc.png"))
+
+    # ===================== SUMMARY (STRICT + VALIDATED) =====================
+
+    # ---- Overrides (optional, for 100% deterministic mapping) ----
+    overrides = (config.get("summary_overrides") or {})
+    def pick(col_from_cfg, fallback): return col_from_cfg if col_from_cfg else fallback
+
+    def find_energy_col(*hints, require_energy=True):
+        any_of = list(hints) + (["kwh", "energy"] if require_energy else [])
+        none_of = ["time","index","simulation","soc","temp","price","cost","tariff"]
+        return find_best(any_of=[x.lower() for x in any_of], none_of=none_of)
+
+    def find_power_col(*hints):
+        any_of = list(hints) + ["kw","power","demand"]
+        none_of = ["time","index","simulation","soc","temp","price","cost","tariff","kwh"]
+        return find_best(any_of=[x.lower() for x in any_of], none_of=none_of)
+
+    total_consumption_cols = overrides.get("total_consumption_kwh_cols")
+    if total_consumption_cols:
+        total_consumption_cols = [c for c in total_consumption_cols if c in df.columns]
+
+    grid_col    = pick(overrides.get("grid_to_building_col"),    find_energy_col("grid","to","load","building"))
+    pv_direct   = pick(overrides.get("pv_to_building_col"),      find_energy_col("pv","solar","to","load","building"))
+    b2b         = pick(overrides.get("battery_to_building_col"), find_energy_col("battery","bat","to","load","building"))
+    pv_export   = pick(overrides.get("pv_export_col"),
+                       find_best(any_of=["pv","solar","export","feed","to grid"], none_of=["soc","cost","price"]))
+    cost_col    = pick(overrides.get("cost_col"),                find_best(any_of=["cost","price","tariff"], none_of=["soc"]))
+    demand_col  = pick(overrides.get("demand_kw_col"),           find_power_col("site","building","total"))
+    soc_col     = pick(overrides.get("soc_col"),                 find_best(must_have=["soc"], none_of=["cost","price"]))
+
+    tes_override_map = overrides.get("tes_cols") or {}
+    tes_cols = {b: (tes_override_map.get(b) or find_best(any_of=["tes","tank"], prefer_building=b)) for b in B_list}
+
+    def validate_energy_series(name, arr):
+        a = to_num(arr)
+        if np.all(~np.isfinite(a)): print(f"⚠️  '{name}' rejected (non-numeric)."); return np.full_like(a, np.nan)
+        if np.nanmin(a) < -1e-6:    print(f"⚠️  '{name}' had negatives; clipping to 0."); a = np.clip(a, 0, None)
+        if np.nanmedian(a) > 1e5:   print(f"⚠️  '{name}' too large for kWh; rejecting."); return np.full_like(a, np.nan)
+        return a
+
+    def validate_power_series(name, arr):
+        a = to_num(arr)
+        if np.all(~np.isfinite(a)): print(f"⚠️  '{name}' rejected (non-numeric)."); return np.full_like(a, np.nan)
+        if np.nanmin(a) < -1e-6:    print(f"⚠️  '{name}' had negatives; clipping to 0."); a = np.clip(a, 0, None)
+        if np.nanmedian(a) > 5e5:   print(f"⚠️  '{name}' too large for kW; rejecting."); return np.full_like(a, np.nan)
+        return a
+
+    # Totals
+    if total_consumption_cols:
+        total_e = float(np.nansum([np.nansum(validate_energy_series(c, df[c])) for c in total_consumption_cols]))
+    else:
+        total_e = np.nan
+
+    grid_use = np.nan
+    if grid_col and grid_col in df.columns:
+        grid_use = float(np.nansum(validate_energy_series(grid_col, df[grid_col])))
+
+    pv_direct_use      = float(np.nansum(validate_energy_series(pv_direct, df[pv_direct]))) if pv_direct in df.columns else np.nan
+    battery_contrib    = float(np.nansum(validate_energy_series(b2b, df[b2b]))) if b2b in df.columns else np.nan
+    pv_surplus_to_grid = float(np.nansum(validate_energy_series(pv_export, df[pv_export]))) if pv_export in df.columns else np.nan
+
+    max_peak_kw = np.nan
+    if demand_col and demand_col in df.columns:
+        arr = validate_power_series(demand_col, df[demand_col])
+        max_peak_kw = float(np.nanmax(arr)) if np.isfinite(np.nanmax(arr)) else np.nan
+
+    # --- cost: prefer simulator's ground-truth, fallback to column sum ---
+    total_cost_env = getattr(env, "episode_cost", None)
+    if total_cost_env is not None and np.isfinite(total_cost_env):
+        total_cost = float(total_cost_env)
+    else:
+        if cost_col and cost_col in df.columns:
+            cost_arr = to_num(df[cost_col])
+            if np.nanmedian(cost_arr) > 1e6:
+                print(f"⚠️  '{cost_col}' too large for €; rejecting column.")
+                cost_arr[:] = np.nan
+            total_cost = float(np.nansum(cost_arr))
+        else:
+            total_cost = np.nan
+    total_cost = round(total_cost, 2)
+
+    # KPIs
+    ss = float(getattr(env, "self_sufficiency", np.nan))
+    sc = float(getattr(env, "self_consumption", np.nan))
+
+    # TES violations (compare in Kelvin)
+    def count_violations(tes_col):
+        if not tes_col or tes_col not in df.columns: return (0, 0)
+        vals = to_num(df[tes_col]); below = int(np.nansum(vals < tes_min_K)); above = int(np.nansum(vals > tes_max_K))
+        return below, above
+
+    tes_global = find_best(any_of=["tes","tank"], none_of=[*(b.lower() for b in B_list)])
+    glob_below, glob_above = count_violations(tes_global)
+    per_b_viols = {b: count_violations(tes_cols.get(b)) for b in B_list}
+
+    # Log mappings + stats
+    used = {
+        "grid_col": grid_col, "pv_direct": pv_direct, "battery_to_building": b2b,
+        "pv_export": pv_export, "cost_col": cost_col, "demand_kw_col": demand_col,
+        "soc_col": soc_col, "tes_cols": tes_cols, "total_consumption_cols": total_consumption_cols
+    }
+    pd.DataFrame([used]).to_json(os.path.join(out_dir, "summary_column_mapping.json"), orient="records", indent=2)
+    stats_rows = []
+    for name, col in [("grid_col", grid_col), ("pv_direct", pv_direct), ("battery_to_building", b2b),
+                      ("pv_export", pv_export), ("cost_col", cost_col), ("demand_kw_col", demand_col)]:
+        if col in df.columns:
+            a = to_num(df[col])
+            stats_rows.append({"name": name, "column": col, "min": np.nanmin(a), "median": np.nanmedian(a),
+                               "max": np.nanmax(a), "non_nan": int(np.isfinite(a).sum())})
+    if stats_rows:
+        pd.DataFrame(stats_rows).to_csv(os.path.join(out_dir, "summary_input_stats.csv"), index=False)
+
+    # ---- Build clean summary row (exact headers) ----
+    def cfg_get_any(cfg, keys, default=None):
+        for k in keys:
+            if k in cfg: return cfg[k]
+        kl = {str(x).lower(): x for x in cfg.keys()}
+        for k in kl:
+            for want in keys:
+                if want.lower() in k: return cfg[kl[k]]
+        return default
+
+    test_number = cfg_get_any(config, ["test_number", "exp_name", "run_name"], default=os.path.basename(getattr(env, "res_path", "Offline-DRL.Target.1.Turin")))
+    city        = cfg_get_any(config, ["city", "site", "location"], default="Target")
+    pv_size_kw  = cfg_get_any(config, ["pv_size_kw","pv_kw","pv_capacity_kw","pv_size"], default=25)
+    bat_size_kwh= cfg_get_any(config, ["battery_size_kwh","bat_kwh","battery_capacity_kwh","battery_capacity"], default=18)
+
+    header = [
+        "Test number","City","PV size (kW)","Battery size (kWh)",
+        "Total electricity consumption (kWh)","Grid consumption (kWh)",
+        "PV direct usage (kWh)","Battery contribution (kWh)","PV surplus to grid (kWh)",
+        "Maximum peak demand (kW)","Total electricity cost (€)",
+        "Self sufficiency (%)","Self consumption (%)",
+        "TES min violations (hours)","TES max violations (hours)"
+    ]
+    for b in B_list:
+        header += [f"Building {b} TES min violations (hours)", f"Building {b} TES max violations (hours)"]
+
+    row = [
+        test_number, city, pv_size_kw, bat_size_kwh,
+        total_e, grid_use, pv_direct_use, battery_contrib,
+        pv_surplus_to_grid, max_peak_kw, total_cost,
+        ss, sc, glob_below, glob_above
+    ]
+    for b in B_list:
+        vmin, vmax = per_b_viols.get(b, (0, 0)); row += [vmin, vmax]
+
+    summary_path = os.path.join(out_dir, "summary_bc_trials.csv")
+    pd.DataFrame([row], columns=header).to_csv(summary_path, index=False, encoding="utf-8-sig")
+    print(f"✅ Saved clean summary to {summary_path}")
+
+    return True
+
+
+def _save_bc_summary_to_csv(config, env, summary_path="data/result/summary_bc_trials.csv", run_dir=None):
+    """Save cost, self-sufficiency, self-consumption: (1) append to global CSV, (2) save in run folder."""
+    row = {
+        "Test number": config.get("test_number", "BC_unknown"),
+        "City": config.get("city", "Unknown"),
+        "Total cost (€)": round(env.episode_cost, 2),
+        "Self sufficiency (%)": round(env.self_sufficiency, 2),
+        "Self consumption (%)": round(env.self_consumption, 2),
+    }
+    if "." in str(row["Test number"]):
+        parts = str(row["Test number"]).split(".")
+        row["City"] = parts[-2] if len(parts) >= 2 else row["City"]
+
+    df_new = pd.DataFrame([row])
+
+    # 1) Save in run folder (local to this configuration)
+    if run_dir:
+        local_path = os.path.join(run_dir, "summary_bc.csv")
+        df_new.to_csv(local_path, index=False)
+        print(f"✅ Summary saved to {local_path}")
+
+    # 2) Append to global summary
+    os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
+    if os.path.exists(summary_path):
+        df_existing = pd.read_csv(summary_path)
+        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+    df_combined.to_csv(summary_path, index=False)
+    print(f"✅ Results appended to {summary_path}")
+
+
+def test_bc_controller(config_path=None):
+    if config_path is None:
+        config_path = "sim_config/config0.json"
+        print("\n" + "=" * 70)
+        print("  WARNING: NO CONFIG PASSED. Using config0.json (Target_building_1)")
+        print("  To run a different config, you MUST pass it as argument:")
+        print('    python test_bc_controller.py sim_config/Target_building_5.json')
+        print("  Or use: RUN_BC.bat Target_building_5")
+        print("=" * 70 + "\n")
+    if not os.path.isabs(config_path):
+        config_path = os.path.abspath(config_path)
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r") as f:
         config = json.load(f)
+    config["control_type"] = "bc"  # Use raw [mf,T] actions (not DRL scalar)
 
-    config['control_type'] = 'drl'
+    result_path = config.get("result_path", "data/result/BC")
+    if not os.path.isabs(result_path):
+        result_path = os.path.abspath(result_path)
+    config["result_path"] = result_path
 
-    # Create test directory
-    test_dir = "data/result/BC/test"
-    if not os.path.exists(test_dir):
-        os.makedirs(test_dir)
+    # add timestamp so each run creates a new folder (no overwriting)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config["_run_timestamp"] = run_ts
 
-    # Initialize environment and controller
-    print("Initializing environment and controller...")
+    test_number = config.get("test_number", "default")
+    run_folder = os.path.join(result_path, f"Test_{test_number}_{run_ts}")
+    summary_csv = os.path.join(result_path, "summary_bc_trials.csv")
+
+    print("\n" + "=" * 70)
+    print("  BC TEST - CONFIGURATION (confirm these match your intended run)")
+    print("=" * 70)
+    print(f"  CONFIG FILE:      {config_path}")
+    print(f"  TEST_NUMBER:      {test_number}")
+    print(f"  RESULT_PATH:      {result_path}")
+    print(f"  OUTPUT FOLDER:    {run_folder}")
+    print(f"  SUMMARY CSV:      {summary_csv}")
+    print("=" * 70 + "\n")
     env = MultipleHPCooling(config, test_mode=True)
-    controller = BCController(env)
+    run_dir = env.res_path
+    os.makedirs(run_dir, exist_ok=True)
 
-    # Train for one episode
-    print("\nStarting training for one episode...")
-    controller.learn()
+    run_id = str(test_number).replace(" ", "_").replace("/", "_").replace("\\", "_")
+    result_path_for_model = config.get("result_path", "data/result/BC")
+    if not os.path.isabs(result_path_for_model):
+        result_path_for_model = os.path.abspath(result_path_for_model)
+    preferred_model = os.path.join(result_path_for_model, "BC_trained", run_id, "best_model.pth")
+    fallback_same_id = os.path.join("data", "result", "BC_trained", run_id, "best_model.pth")
+    fallback_generic = "data/result/BC_trained/best_model.pth"
 
-    # Test deployment
-    print("\nStarting test deployment...")
+    if os.path.exists(preferred_model):
+        model_path = preferred_model
+    elif os.path.exists(fallback_same_id):
+        model_path = fallback_same_id
+        print(f"  NOTE: Using model from data/result/BC_trained/{run_id}/ (not in result_path)")
+    elif os.path.exists(fallback_generic):
+        model_path = fallback_generic
+        print("\n" + "!" * 70)
+        print(f"  WARNING: No model for {test_number}. Using generic model.")
+        print(f"  Run collect + train for this config first: RUN_BC.bat {test_number}")
+        print("  Results may be incorrect!")
+        print("!" * 70 + "\n")
+    else:
+        raise FileNotFoundError(
+            f"No model found for {test_number}. Run:\n"
+            f"  python collect_rbc_data.py sim_config/{test_number}.json\n"
+            f"  python train_bc_network.py sim_config/{test_number}.json\n"
+            f"Or: RUN_BC.bat {test_number}"
+        )
+
+    controller = BCController(env, trained_model_path=model_path)
+
+    print("\nRunning BC controller test...")
     observation = env.reset()
     done = False
-    episode_rewards = []
     total_steps = 0
-
     while not done:
         action, _ = controller.predict(observation)
         observation, reward, done, info = env.step(action)
-        episode_rewards.append(reward)
         total_steps += 1
+        if total_steps % 24 == 0:
+            print(f"Day {total_steps // 24}: Reward = {reward:.2f}")
 
-        if total_steps % 24 == 0:  # Print daily progress
-            day = total_steps // 24
-            daily_reward = sum(episode_rewards[-24:])
-            print(f"Day {day}: Reward = {daily_reward:.2f}")
+    print("\n==== Final Results ====")
+    print(f"Total steps: {total_steps}")
+    print(f"Total reward: {env.episode_reward:.2f}")
+    print(f"Total cost: {env.episode_cost:.2f}")
+    print(f"Self-sufficiency: {env.self_sufficiency:.2f}%")
+    print(f"Self-consumption: {env.self_consumption:.2f}%")
 
-    print("\nFinal Results:")
-    print(f"Total Cost: {env.episode_cost:.2f}")
-    print(f"Total Reward: {env.episode_reward:.2f}")
-    print(f"Self Sufficiency: {env.self_sufficiency:.2f}%")
-    print(f"Self Consumption: {env.self_consumption:.2f}%")
+    # Save per-run results to this run's folder (all config outputs in one place)
+    controller.save(os.path.join(run_dir, "final_bc_controller.pth"))
+    print(f"✅ Controller saved to {run_dir}")
 
-    # Save final controller
-    controller.save(f"{test_dir}/final_bc_controller")
-    print(f"\nController saved to {test_dir}/final_bc_controller")
+    # Save summary: in run folder + append to result_path/summary_bc_trials.csv
+    summary_in_result = os.path.join(result_path, "summary_bc_trials.csv")
+    _save_bc_summary_to_csv(config, env, summary_path=summary_in_result, run_dir=run_dir)
+
+    print("\nGenerating BC visualizations...")
+    visualize_bc_results(env, config)
+
+    print("\n" + "=" * 70)
+    print("  RESULTS SAVED (verify these paths match your config)")
+    print("=" * 70)
+    print(f"  This run:    {run_dir}")
+    print(f"  test.csv:    {os.path.join(run_dir, 'test.csv')}")
+    print(f"  summary_bc:  {os.path.join(run_dir, 'summary_bc.csv')}")
+    print(f"  All runs:    {summary_in_result}")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
-    test_bc_controller()
+    import sys
+    cfg = sys.argv[1] if len(sys.argv) > 1 else None
+    if cfg is None:
+        print("=" * 60)
+        print("WARNING: No config file passed. Using config0.json")
+        print("To use YOUR config, run:")
+        print('  python test_bc_controller.py sim_config/Target_building_X.json')
+        print("=" * 60)
+    test_bc_controller(config_path=cfg)
