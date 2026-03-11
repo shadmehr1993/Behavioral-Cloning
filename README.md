@@ -15,6 +15,7 @@ The model outputs the control actions applied to the system, including:
 * pump mass flow rate
 * storage operation commands
 By learning from historical expert demonstrations, the BC agent can reproduce stable control behavior while providing a foundation for more advanced learning-based strategies.
+
 ⚠️ **Note:**
 This repository shares **a partial implementation of the behavioral cloning agent** used in the study. The full experimental framework, including additional controllers and the complete co-simulation environment, is part of the research project described in the associated publication.
 The shared implementation is intended for **educational purposes and reproducibility of the learning methodology**, rather than full replication of the entire district simulation environment.
