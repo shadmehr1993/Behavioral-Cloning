@@ -21,6 +21,7 @@ This repository provides a modular implementation of a **Behavioral Cloning (BC)
 The BC agent learns a control policy by **imitating expert behavior** from a **Rule-Based Controller (RBC)**, which generates state–action demonstration pairs under varying environmental and load conditions. A neural network is then trained via supervised learning to approximate the expert's mapping from system states to control actions.
 
 The result is a data-driven controller that **reproduces stable, expert-level behavior** while serving as a strong foundation for more advanced learning strategies such as Reinforcement Learning or Transfer Learning.
+<img width="461" height="631" alt="image" src="https://github.com/user-attachments/assets/a7321de7-fd3e-48ca-938d-d58954b0dccd" />
 
 > ⚠️ **Note:** This repository shares a **partial implementation** of the BC agent used in the study. The full experimental framework, including additional controllers and the complete co-simulation environment, is part of the associated research project. The shared code is intended for **educational purposes and reproducibility of the learning methodology**.
 
